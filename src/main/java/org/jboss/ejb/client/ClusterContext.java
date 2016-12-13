@@ -28,13 +28,16 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -58,6 +61,8 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
     // default to RandomClusterNodeSelector
     private ClusterNodeSelector clusterNodeSelector = new RandomClusterNodeSelector();
     private final Set<ClusterContextListener> clusterContextListeners = new HashSet<ClusterContextListener>();
+    // Ensure no more connections are allocated than what's configured
+    private final Semaphore connectionCreationSemaphore;
 
     /**
      * The nodes to which a connected has already been established in this cluster context
@@ -74,6 +79,7 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
         } else {
             this.maxClusterNodeOpenConnections = 10; // default to 10
         }
+        this.connectionCreationSemaphore = new Semaphore((int) maxClusterNodeOpenConnections);
     }
 
     public String getClusterName() {
@@ -304,14 +310,22 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
                 if (nodeName == null || nodeName.trim().isEmpty()) {
                     throw Logs.MAIN.nodeNameCannotBeNullOrEmptyStringForCluster(this.clusterName);
                 }
+
+                connectionCreationSemaphore.acquire();
+
                 // don't add a ClusterNodeManager for a node which is already managed
-                if (this.nodeManagers.putIfAbsent(nodeName, clusterNodeManager) != null)
-                    continue;
+                if (this.nodeManagers.putIfAbsent(nodeName, clusterNodeManager) != null) {
+                  connectionCreationSemaphore.release();
+                  continue;
+                }
+
                 // If the connected nodes in this cluster context hasn't yet reached the max allowed limit, then create a new
                 // receiver and associate it with a receiver context (if the node isn't already connected to)
                 if (!this.connectedNodes.contains(nodeName) && this.connectedNodes.size() < maxClusterNodeOpenConnections) {
                     // submit a task which will create and associate a EJB receiver with this cluster context
-                    futureAssociationResults.add(executorService.submit(new EJBReceiverAssociationTask(this, nodeName)));
+                    futureAssociationResults.add(executorService.submit(new EJBReceiverAssociationTask(this, nodeName, connectionCreationSemaphore)));
+                } else {
+                  connectionCreationSemaphore.release();
                 }
             }
             // wait for the associations to be completed so that the other threads which are expecting
@@ -323,6 +337,10 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
                     // ignore
                 }
             }
+        } catch (InterruptedException ie) {
+          final String message = "Unable to aquire permit for allocating a connection";
+          logger.error(message, ie);
+          throw new IllegalStateException(message, ie);
         } finally {
             for (final ClusterContextListener listener : this.clusterContextListeners) {
                 try {
@@ -481,35 +499,42 @@ public final class ClusterContext implements EJBClientContext.EJBReceiverContext
 
         private final ClusterContext clusterContext;
         private final String nodeName;
+        private final Semaphore semaphore;
 
         /**
          * @param clusterContext The cluster context
          * @param nodeName       The node name
+         * @param semaphore      The Semaphore used to control the number of created connections.
          */
-        EJBReceiverAssociationTask(final ClusterContext clusterContext, final String nodeName) {
+        EJBReceiverAssociationTask(final ClusterContext clusterContext, final String nodeName, final Semaphore semaphore) {
             this.nodeName = nodeName;
             this.clusterContext = clusterContext;
+            this.semaphore = semaphore;
         }
 
 
         @Override
         public Void call() throws Exception {
-            final ClusterNodeManager clusterNodeManager = this.clusterContext.nodeManagers.get(this.nodeName);
-            if (clusterNodeManager == null) {
-                // we don't have a cluster node manager which could create the EJB receiver, for this
-                // node name
-                logger.debugf("Cannot create EJBReceiver since no cluster node manager found for node %s in cluster context for cluster %s",
-                        nodeName, clusterName);
-                return null;
+            try {
+              final ClusterNodeManager clusterNodeManager = this.clusterContext.nodeManagers.get(this.nodeName);
+              if (clusterNodeManager == null) {
+                  // we don't have a cluster node manager which could create the EJB receiver, for this
+                  // node name
+                  logger.debugf("Cannot create EJBReceiver since no cluster node manager found for node %s in cluster context for cluster %s",
+                          nodeName, clusterName);
+                  return null;
+              }
+              // get the EJB receiver from the node manager
+              final EJBReceiver ejbReceiver = clusterNodeManager.getEJBReceiver();
+              if (ejbReceiver == null) {
+                  return null;
+              }
+              // associate the receiver with the cluster context
+              this.clusterContext.registerEJBReceiver(ejbReceiver);
+              return null;
+            } finally {
+              this.semaphore.release();
             }
-            // get the EJB receiver from the node manager
-            final EJBReceiver ejbReceiver = clusterNodeManager.getEJBReceiver();
-            if (ejbReceiver == null) {
-                return null;
-            }
-            // associate the receiver with the cluster context
-            this.clusterContext.registerEJBReceiver(ejbReceiver);
-            return null;
         }
     }
 

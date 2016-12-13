@@ -30,3 +30,4 @@ pom.xml.versionsBackup
 server.log
 # ignore java crashes
 hs_err_pid*.log
+/.apt_generated/

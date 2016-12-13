@@ -21,6 +21,7 @@
  */
 package org.jboss.ejb.client.test.common;
 
+import org.jboss.ejb.client.Affinity;
 import org.jboss.ejb.client.AttachmentKeys;
 import org.jboss.ejb.client.ClusterAffinity;
 import org.jboss.ejb.client.EJBClientInvocationContext;
@@ -61,7 +62,10 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -81,9 +85,12 @@ public class DummyServer {
     public static final String RESPONSE_WAS_COMPRESSED = "Response was compressed";
 
     private static final String[] supportedMarshallerTypes = new String[]{"river", "java-serial"};
-    private static final String CLUSTER_NAME = "dummy-cluster";
+    public static final String CLUSTER_NAME = "dummy-cluster";
     private static final ThreadLocal<Boolean> requestCompressed = new ThreadLocal<Boolean>();
     private static final ThreadLocal<Boolean> responseCompressed = new ThreadLocal<Boolean>();
+    
+    /** Holds all started DummyServers per cluster name. */
+    private static final Map<String, List<DummyServer>> clusterNodes = Collections.synchronizedMap(new HashMap<String, List<DummyServer>>());
 
     private Endpoint endpoint;
 
@@ -106,8 +113,55 @@ public class DummyServer {
         this.endpointName = endpointName;
     }
 
+    /**
+     * Registers a DummyServer in the {@link #clusterNodes}, making it available for {@link #getClusterNodes(String)}.
+     * 
+     * @param server The DummyServer instance.
+     */
+    private static synchronized void registerNode(final DummyServer server)
+    {
+      final String clusterName = server.getClusterName();
+      List<DummyServer> nodes = clusterNodes.get(clusterName);
+      
+      if (nodes == null) {
+        nodes = new LinkedList<DummyServer>();
+        clusterNodes.put(clusterName, nodes);
+      }
+      
+      nodes.add(server);
+    }
+    
+    /**
+     * Unregisters a DummyServer from the {@link #getClusterNodes(String)} making it unvailable for {@link #getClusterNodes(String)}.
+     * 
+     * @param server The DummyServer instance.
+     */
+    private static synchronized void unregisterNode(final DummyServer server)
+    {
+      final List<DummyServer> nodes = clusterNodes.get(server.getClusterName());
+      
+      if (nodes != null) {
+        nodes.remove(server);
+      }
+    }
+    
+    /**
+     * Returns a List of registered nodes for a requested cluster name.
+     * 
+     * @param cluster The cluster name.
+     * 
+     * @return A List holding the cluster nodes, never null.
+     */
+    public static synchronized List<DummyServer> getClusterNodes(final String cluster) {
+      final List<DummyServer> nodes = clusterNodes.get(cluster);
+      return (nodes != null ? new LinkedList<DummyServer>(nodes) : Collections.<DummyServer>emptyList());
+    }
+
     public void start() throws IOException {
         logger.info("Starting " + this);
+
+        registerNode(this);
+
         final OptionMap options = OptionMap.EMPTY;
         endpoint = Remoting.createEndpoint(this.endpointName, options);
         endpoint.addConnectionProvider("remote", new RemoteConnectionProviderFactory(), OptionMap.create(Options.SSL_ENABLED, Boolean.FALSE));
@@ -156,11 +210,12 @@ public class DummyServer {
                 outputStream.flush();
                 outputStream.close();
             }
-
         }, OptionMap.EMPTY);
     }
 
     public void stop() throws IOException {
+        unregisterNode(this);
+      
         this.server.close();
         this.server = null;
         IoUtils.safeClose(this.endpoint);
@@ -247,7 +302,12 @@ public class DummyServer {
                                     modifiedResult = RESPONSE_WAS_COMPRESSED + " " + modifiedResult;
                                 }
                             }
-                            this.dummyProtocolHandler.writeMethodInvocationResponse(dataOutputStream, methodInvocationRequest.getInvocationId(), modifiedResult, methodInvocationRequest.getAttachments());
+                            
+                            // Send weak ClusterAffinity as attachment 
+                            final Map<String, Object> requestAttachments = methodInvocationRequest.getAttachments();
+                            final Map<String, Object> modifiedAttachments = new HashMap<String, Object>((requestAttachments != null ? requestAttachments : Collections.<String, Object>emptyMap()));
+                            modifiedAttachments.put(Affinity.WEAK_AFFINITY_CONTEXT_KEY, new ClusterAffinity(CLUSTER_NAME));
+                            this.dummyProtocolHandler.writeMethodInvocationResponse(dataOutputStream, methodInvocationRequest.getInvocationId(), modifiedResult, modifiedAttachments);
                         } finally {
                             dataOutputStream.close();
                         }
@@ -418,6 +478,65 @@ public class DummyServer {
         }
     }
 
+    
+    
+    /**
+     * Send a cluster topology message based on the registered servers.
+     * 
+     * @param channel The output Channel.
+     * 
+     * @throws IOException If an I/O exception occurs.
+     */
+    public void sendClusterTopologyMessageToClients() throws IOException {
+      if (this.openChannels.isEmpty()) {
+        logger.debug("No open channels to send EJB module availability");
+      }
+
+      for (final Channel channel : this.openChannels) {
+          try {
+            final DataOutputStream output = new DataOutputStream(channel.writeMessage());
+            try {
+                // Cluster topology message
+                output.write(0x15);
+                
+                // Write cluster 
+                PackedInteger.writePackedInteger(output, 1);
+                output.writeUTF(DummyServer.CLUSTER_NAME);
+                
+                // Write node count
+                final List<DummyServer> nodes = DummyServer.getClusterNodes(DummyServer.CLUSTER_NAME);
+                PackedInteger.writePackedInteger(output, nodes.size());
+                
+                for (final DummyServer node : nodes) {
+                    // Write node name
+                    final InetSocketAddress address = (InetSocketAddress) node.server.getLocalAddress();
+                    output.writeUTF("localhost_" + address.getPort());
+                    
+                    // Write client mappings
+                    PackedInteger.writePackedInteger(output, 1);
+                    
+                    // Write differentiator
+                    PackedInteger.writePackedInteger(output, 1);
+          
+                    // write client source network address
+                    output.write(address.getAddress().getAddress());
+                    // destination address
+                    output.writeUTF(address.getHostName());
+                    // destination port
+                    output.writeShort(address.getPort());
+                }
+                
+                output.flush();
+            } finally {
+              output.close();
+            }
+          } catch(Throwable t) {
+            t.printStackTrace();
+            throw new IllegalStateException(t);
+          }
+        }
+    }
+    
     private void writeModuleAvailability(final DataOutput output, final EJBModuleIdentifier[] ejbModuleIdentifiers) throws IOException {
         if (output == null) {
             throw new IllegalArgumentException("Cannot write to null output");
@@ -548,6 +667,7 @@ public class DummyServer {
                         channel.receiveMessage(receiver);
                         // send module availability report to clients
                         final Collection<EJBModuleIdentifier> availableModules = DummyServer.this.registeredEJBs.keySet();
+//                        DummyServer.this.sendClusterTopologyMessageToClients();
                         DummyServer.this.sendNewModuleReportToClients(availableModules.toArray(new EJBModuleIdentifier[availableModules.size()]), true);
                         break;
                     default:
